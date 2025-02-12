@@ -47,32 +47,30 @@ def plot_logs(env, output_dir):
     plt.plot(time, sigma[:, 0], label="σ₁")
     plt.plot(time, sigma[:, 1], label="σ₂")
     plt.plot(time, sigma[:, 2], label="σ₃")
-    plt.ylabel("Attitude (σ)")
+    plt.title("Attitude (σ)")
     plt.legend()
-    plt.title("MRP Components")
+    plt.ylabel("MRP Components")
 
     # Plot attitude error
     plt.subplot(5, 1, 2)
     plt.plot(time, sigma_norm)
-    plt.ylabel("Attitude Error")
-    plt.title("σ Error")
-    plt.legend()
+    plt.title("Attitude Error")
+    plt.ylabel("σ Error")
 
     # Plot Angular Velocity
     plt.subplot(5, 1, 3)
     plt.plot(time, omega[:, 0], label="ω₁")
     plt.plot(time, omega[:, 1], label="ω₂")
     plt.plot(time, omega[:, 2], label="ω₃")
-    plt.ylabel("Angular Velocity (rad/s)")
+    plt.title("Angular Velocity (rad/s)")
     plt.legend()
-    plt.title("AngVel ω")
+    plt.ylabel("AngVel ω")
 
     # Plot angular velocity magnitude
     plt.subplot(5, 1, 4)
     plt.plot(time, omega_mag)
-    plt.ylabel("Angular Velocity Magnitude (rad/s)")
-    plt.legend()
-    plt.title("ω mag")
+    plt.title("Angular Velocity Magnitude (rad/s)")
+    plt.ylabel("ω mag")
     
 
     # Plot Thruster Firings
