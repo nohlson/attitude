@@ -38,30 +38,72 @@ class SpacecraftAttitudeEnv(gym.Env):
 
         # Store configuration
         self.step_size = step_size
-        self.mass_properties = mass_properties or {
-            'mass': 25.0,  # kg
+
+
+        mass = 500.0  # kg
+        # For a cuboid with length (l)=2.0, width (w)=1.5, height (h)=1.0
+        Ixx = (1/12) * mass * (1.0**2 + 1.5**2)   # ~135.42
+        Iyy = (1/12) * mass * (2.0**2 + 1.0**2)   # ~208.33
+        Izz = (1/12) * mass * (2.0**2 + 1.5**2)   # ~260.42
+        mass_properties = {
+            'mass': mass,
             'inertia': [
-                [1000.0, 0.0,   0.0],
-                [0.0,   800.0,  0.0],
-                [0.0,   0.0,    600.0]
-            ]  # kg*m^2
+                [Ixx, 0.0, 0.0],
+                [0.0, Iyy, 0.0],
+                [0.0, 0.0, Izz]
+            ]
         }
-        self.thruster_config = thruster_config or {
+        self.mass_properties = mass_properties        
+        thruster_config = {
             'locations': [
-                [1.0, 1.0, 0.0],     # Thruster 1
-                [-1.0, 1.0, 0.0],    # Thruster 2
-                [-1.0, -1.0, 0.0],   # Thruster 3
-                [1.0, -1.0, 0.0]     # Thruster 4
+                # Thrusters on the +X face
+                [ 1.0,  0.5,  0.5],
+                [ 1.0, -0.5, -0.5],
+                # Thrusters on the -X face
+                [-1.0,  0.5, -0.5],
+                [-1.0, -0.5,  0.5],
+                # Thrusters on the +Y face
+                [ 0.5,  0.75,  0.5],
+                [-0.5,  0.75, -0.5],
+                # Thrusters on the -Y face
+                [ 0.5, -0.75, -0.5],
+                [-0.5, -0.75,  0.5],
+                # Thrusters on the +Z face
+                [ 0.5,  0.5,  0.75],
+                [-0.5, -0.5,  0.75],
+                # Thrusters on the -Z face
+                [ 0.5, -0.5, -0.75],
+                [-0.5,  0.5, -0.75]
             ],
             'directions': [
-                [0.0, 0.0, 1.0],     # +Z
+                # Directions are the outward normals of the faces
+                # +X face
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                # -X face
+                [-1.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0],
+                # +Y face
+                [0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                # -Y face
+                [0.0, -1.0, 0.0],
+                [0.0, -1.0, 0.0],
+                # +Z face
                 [0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+                # -Z face
                 [0.0, 0.0, -1.0],
-                [0.0, 0.0, -1.0]
+                [0.0, 0.0, -1.0],
             ],
-            'max_thrust': 10.0,   # Newtons
+            'max_thrust': 5.0,   # Newtons; adjust based on your actuation requirements
             'min_thrust': 0.0
         }
+
+        self.thruster_config = thruster_config
+
+        # --- Reward Weights ---
+        self.reward_weights = {'attitude': 1.0, 'angular': 0.1}        
 
         # Define action/observation spaces
         n_thrusters = len(self.thruster_config['locations'])
@@ -191,11 +233,13 @@ class SpacecraftAttitudeEnv(gym.Env):
         """
         Gymnasium step => (obs, reward, terminated, truncated, info)
         """
+        start_nanos = macros.sec2nano(self.current_time)
+        end_nanos   = macros.sec2nano(self.current_time + self.step_size)
+        self.next_stop_time = end_nanos
+
         self._apply_action(action)
 
         # Advance Basilisk by step_size
-        start_nanos = macros.sec2nano(self.current_time)
-        end_nanos   = macros.sec2nano(self.current_time + self.step_size)
         self.scSim.ConfigureStopTime(end_nanos)
         self.scSim.ExecuteSimulation()
         self.current_time += self.step_size
@@ -205,7 +249,13 @@ class SpacecraftAttitudeEnv(gym.Env):
         terminated = self._check_done(obs)
         truncated = False  # or add your own time limit
 
-        return obs, reward, terminated, truncated, {}
+        # Create info for custom metrics
+        info = {
+            'attitude_error': np.linalg.norm(obs[:3]),
+            'angular_velocity': np.linalg.norm(obs[3:]),
+        }
+
+        return obs, reward, terminated, truncated, info
 
     def _get_observation(self):
         """Read MRP and angular velocity from scStateOutMsg."""
@@ -228,27 +278,27 @@ class SpacecraftAttitudeEnv(gym.Env):
         commands = [(action >> i) & 1 for i in range(n_thrusters)]
 
         # Prepare on-time array
-        thruster_ontimes = []
+        thruster_ontimes = [0.0] * n_thrusters
         for i, cmd in enumerate(commands):
-            thruster_ontimes.append(cmd * 0.1)
+            thruster_ontimes[i] = cmd * self.step_size
 
         self.thrusterCmdMsg.OnTimeRequest = thruster_ontimes
 
         # Write the updated on-time commands
-        self.thrusterOnTimeMsg.write(self.thrusterCmdMsg)
+        self.thrusterOnTimeMsg.write(self.thrusterCmdMsg, self.next_stop_time)
 
     def _compute_reward(self, obs):
         """
-        Reward is negative of attitude error + angular velocity penalty.
+        Computes the reward as the negative weighted sum of the attitude (MRP) error and angular velocity magnitude.
+        The weights can be adjusted via self.reward_weights.
         """
         sigma = obs[:3]
         omega = obs[3:]
         sigma_norm = np.linalg.norm(sigma)
         omega_mag  = np.linalg.norm(omega)
-
-        # Simple penalty: sum of squares
-        reward = - (sigma_norm**2 + 0.1 * (omega_mag**2))
-
+        # Negative penalty: you can adjust the weights to emphasize one error term over the other.
+        reward = - (self.reward_weights['attitude'] * sigma_norm**2 +
+                    self.reward_weights['angular']  * omega_mag**2)
         return reward
 
     def _check_done(self, obs):

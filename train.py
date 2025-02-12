@@ -5,6 +5,49 @@ import matplotlib.pyplot as plt
 import datetime
 from stable_baselines3 import PPO
 from SpacecraftAttitudeEnv import SpacecraftAttitudeEnv
+from stable_baselines3.common.logger import configure
+from gymnasium.wrappers import TimeLimit
+from stable_baselines3.common.callbacks import BaseCallback
+
+
+# -------------------------------
+# Define a Custom Callback
+# -------------------------------
+class CustomMetricsCallback(BaseCallback):
+    """
+    A custom callback that collects and logs the attitude error and angular velocity
+    from the info dictionary provided by your environment.
+    """
+    def __init__(self, verbose=0):
+        super(CustomMetricsCallback, self).__init__(verbose)
+        self.att_errors = []
+        self.angular_vels = []
+
+    def _on_step(self) -> bool:
+        # Get infos from the current step (works for both vectorized and single envs)
+        infos = self.locals.get("infos", None)
+        if infos is None:
+            info = self.locals.get("info", {})
+            infos = [info]
+        for info in infos:
+            if "attitude_error" in info:
+                self.att_errors.append(info["attitude_error"])
+            if "angular_velocity" in info:
+                self.angular_vels.append(info["angular_velocity"])
+        return True
+
+    def _on_rollout_end(self) -> None:
+        # Compute average metrics for this rollout
+        avg_att_error = np.mean(self.att_errors) if self.att_errors else 0
+        avg_ang_vel = np.mean(self.angular_vels) if self.angular_vels else 0
+
+        # Record these custom metrics under the "custom" namespace so they appear in TensorBoard.
+        self.logger.record("custom/attitude_error", avg_att_error)
+        self.logger.record("custom/angular_velocity", avg_ang_vel)
+
+        # Reset for the next rollout
+        self.att_errors = []
+        self.angular_vels = []
 
 def create_output_directory():
     """
@@ -132,6 +175,8 @@ def main():
 
     # Define environment
     env = SpacecraftAttitudeEnv(step_size=0.1, viz_file=os.path.join(output_dir, "test_output.viz"))
+    #env = SpacecraftAttitudeEnv(step_size=0.1, viz_file=None)
+    envTL = TimeLimit(env, max_episode_steps=1000)
 
     # Training configuration
     train_config = {
@@ -148,9 +193,18 @@ def main():
     }
     save_training_metadata(output_dir, env_config, train_config)
 
+
     # Train model
     model = PPO("MlpPolicy", env, verbose=1, learning_rate=train_config["learning_rate"])
-    model.learn(total_timesteps=train_config["total_timesteps"])
+    # Configure SB3 logging
+    new_logger = configure(folder="logs/", format_strings=["stdout", "csv", "tensorboard"])
+    model.set_logger(new_logger)
+
+    # Custom callback for monitoring training
+    custom_callback = CustomMetricsCallback()
+
+    # Start training
+    model.learn(total_timesteps=train_config["total_timesteps"], callback=custom_callback)
 
     # Save trained model
     model_path = os.path.join(output_dir, "trained_model.zip")
