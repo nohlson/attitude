@@ -19,6 +19,7 @@ from Basilisk.simulation import thrusterDynamicEffector
 from Basilisk.utilities import macros, unitTestSupport
 from Basilisk.utilities import vizSupport
 from Basilisk.architecture import messaging
+from Basilisk.utilities import simIncludeThruster
 
 
 class SpacecraftAttitudeEnv(gym.Env):
@@ -38,7 +39,7 @@ class SpacecraftAttitudeEnv(gym.Env):
         # Store configuration
         self.step_size = step_size
         self.mass_properties = mass_properties or {
-            'mass': 1000.0,  # kg
+            'mass': 25.0,  # kg
             'inertia': [
                 [1000.0, 0.0,   0.0],
                 [0.0,   800.0,  0.0],
@@ -104,39 +105,40 @@ class SpacecraftAttitudeEnv(gym.Env):
         self.scObject.hub.mHub = self.mass_properties['mass']
         self.scObject.hub.IHubPntBc_B = unitTestSupport.np2EigenMatrix3d(inertia_matrix)
 
-        # Create thruster effector
+        # 3) Create the thruster set and add it as a separate model
         self.thrusterSet = thrusterDynamicEffector.ThrusterDynamicEffector()
         self.thrusterSet.ModelTag = "thrusterSet"
-
-        # We'll also add thrusterSet as a separate model to the task, as seen in scenario examples
         self.scSim.AddModelToTask(simTaskName, self.thrusterSet)
 
-        # 3) Add thrusters
-        #    Use Basilisk's THRSimConfig for each thruster
-        n_thrusters = len(self.thruster_config['locations'])
+        # 4) Use thruster factory to create thrusters
+        self.thFactory = simIncludeThruster.thrusterFactory()
+
+        # Example: If you want to choose between different thruster types:
         for loc, direc in zip(self.thruster_config['locations'], self.thruster_config['directions']):
-            thr_config = thrusterDynamicEffector.THRSimConfig()
-            thr_config.thrLoc_B = thrusterDynamicEffector.DoubleVector(list(loc))
-            thr_config.thrDir_B = thrusterDynamicEffector.DoubleVector(list(direc))
-            thr_config.MaxThrust = self.thruster_config['max_thrust']
-            self.thrusterSet.addThruster(thr_config)
+                self.thFactory.create('MOOG_Monarc_1', loc, direc)
 
-        # Option A: Attach thrusterSet to the spacecraft object
-        self.scObject.addDynamicEffector(self.thrusterSet)
+        # 5) Tie thrusters to the spacecraft
+        thrModelTag = "ACSThrusterDynamics"
+        self.thFactory.addToSpacecraft(thrModelTag, self.thrusterSet, self.scObject)
 
-        # 4) Create the on-time command message
-        # This is the recommended approach in scenarioBasicOrbitStream
-        self.n_thrusters = n_thrusters
-        self.thrusterOnTimeData = messaging.THRArrayOnTimeCmdMsgPayload()
-        self.thrusterOnTimeData.OnTimeRequest = [0.0] * n_thrusters
-
-        # Create a Msg object to write these commands
+        # **Create the actual on-time command message object**
         self.thrusterOnTimeMsg = messaging.THRArrayOnTimeCmdMsg()
-        # Subscribe thrusterSet to read from this on-time message
+
+        # This is your data payload
+        n_thrusters = self.thFactory.getNumOfDevices()
+        self.thrusterCmdMsg = messaging.THRArrayOnTimeCmdMsgPayload()
+        self.thrusterCmdMsg.OnTimeRequest = [0.0]*n_thrusters
+
+        # Set initial zero ontime message
+        self.thrusterOnTimeMsg.write(self.thrusterCmdMsg)
+
+        # **Subscribe the thruster set to read from this message**
         self.thrusterSet.cmdsInMsg.subscribeTo(self.thrusterOnTimeMsg)
 
-        # Add the spacecraft object to the task
+        # 8) Add the spacecraft to the simulation task
         self.scSim.AddModelToTask(simTaskName, self.scObject)
+
+        self._setup_logging(simTaskName)
 
         # (Optional) Vizard .viz file
         if self.viz_file is not None:
@@ -144,8 +146,21 @@ class SpacecraftAttitudeEnv(gym.Env):
                 self.scSim,
                 simTaskName,
                 self.scObject,
+                thrEffectorList=self.thrusterSet,
                 saveFile=self.viz_file
             )
+
+
+    def _setup_logging(self, simTaskName):
+        
+        # Setup logging for attitude and angular velocity
+        self.scStateLogger = self.scObject.scStateOutMsg.recorder()
+        self.scSim.AddModelToTask(simTaskName, self.scStateLogger)
+
+        # Setup logging for thruster commands
+        self.thrusterLogger = self.thrusterSet.cmdsInMsg.recorder()
+        self.scSim.AddModelToTask(simTaskName, self.thrusterLogger)
+
 
     def reset(self, seed=None, options=None):
         """
@@ -157,9 +172,13 @@ class SpacecraftAttitudeEnv(gym.Env):
         # Re-init Basilisk
         self.scSim.InitializeSimulation()
 
+        # Clear old logs
+        self.scStateLogger.clear()
+
         # Random initial MRP and angular velocity
         sigma0 = np.random.uniform(-0.3, 0.3, 3)
-        omega0 = np.random.uniform(-0.1, 0.1, 3)
+        #omega0 = np.random.uniform(-0.1, 0.1, 3)
+        omega0 = np.array([0.0, 0.0, 0.0]) # initial zero angular velocity
 
         self.scObject.hub.sigma_BNInit = sigma0
         self.scObject.hub.omega_BN_BInit = omega0
@@ -181,8 +200,6 @@ class SpacecraftAttitudeEnv(gym.Env):
         self.scSim.ExecuteSimulation()
         self.current_time += self.step_size
 
-        print("Stepping {} seconds from {} to {}".format(self.step_size, start_nanos, end_nanos))
-
         obs = self._get_observation()
         reward = self._compute_reward(obs)
         terminated = self._check_done(obs)
@@ -196,6 +213,8 @@ class SpacecraftAttitudeEnv(gym.Env):
         sigma = np.array(stateMsg.sigma_BN, dtype=np.float32)      # 3D MRP
         omega = np.array(stateMsg.omega_BN_B, dtype=np.float32)    # 3D angular velocity
 
+        #print("Angular velocity: ", omega)
+
         obs = np.concatenate([sigma, omega], axis=0)
         return obs
 
@@ -204,14 +223,19 @@ class SpacecraftAttitudeEnv(gym.Env):
         Convert discrete action bits => on-time requests.
         Each thruster is on for 0.1s if bit=1, else 0.0s.
         """
-        commands = [(action >> i) & 1 for i in range(self.n_thrusters)]
+
+        n_thrusters = len(self.thrusterCmdMsg.OnTimeRequest)
+        commands = [(action >> i) & 1 for i in range(n_thrusters)]
 
         # Prepare on-time array
+        thruster_ontimes = []
         for i, cmd in enumerate(commands):
-            self.thrusterOnTimeData.OnTimeRequest[i] = 0.1 if cmd else 0.0
+            thruster_ontimes.append(cmd * 0.1)
+
+        self.thrusterCmdMsg.OnTimeRequest = thruster_ontimes
 
         # Write the updated on-time commands
-        self.thrusterOnTimeMsg.write(self.thrusterOnTimeData)
+        self.thrusterOnTimeMsg.write(self.thrusterCmdMsg)
 
     def _compute_reward(self, obs):
         """
@@ -224,9 +248,6 @@ class SpacecraftAttitudeEnv(gym.Env):
 
         # Simple penalty: sum of squares
         reward = - (sigma_norm**2 + 0.1 * (omega_mag**2))
-
-        print("Current attitude error: {:.3f}, angular velocity: {:.3f}".format(sigma_norm, omega_mag))
-        print("Current angular velocity: {}".format(omega))
 
         return reward
 
